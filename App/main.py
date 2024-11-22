@@ -8,8 +8,8 @@ from pythonjsonlogger import jsonlogger
 from aws_xray_sdk.core import xray_recorder
 from aws_xray_sdk.core import patch
 
-# Habilitar rastreo automático para servicios específicos
-patch(["boto3", "redis"])
+# Habilitar rastreo automático para boto3
+patch(["boto3"])
 
 # Configuración de AWS y Redis
 REDIS_HOST = "your-elasticache-endpoint"
