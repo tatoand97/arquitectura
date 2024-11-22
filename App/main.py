@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import redis
 import boto3
@@ -6,7 +6,6 @@ import json
 import logging
 from pythonjsonlogger import jsonlogger
 from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.ext.fastapi.middleware import XRayMiddleware
 from aws_xray_sdk.core import patch
 
 # Habilitar rastreo automático para servicios específicos
@@ -36,7 +35,16 @@ xray_recorder.configure(
     sampling=True,
     context_missing="LOG_ERROR"
 )
-app.add_middleware(XRayMiddleware)
+
+# Middleware para AWS X-Ray
+@app.middleware("http")
+async def xray_middleware(request: Request, call_next):
+    segment = xray_recorder.begin_segment(name=request.url.path)
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        xray_recorder.end_segment()
 
 # Configurar logger para CloudWatch Logs
 logger = logging.getLogger("fastapi")
@@ -47,7 +55,7 @@ logger.addHandler(log_handler)
 logger.setLevel(logging.INFO)
 
 @app.middleware("http")
-async def log_requests(request, call_next):
+async def log_requests(request: Request, call_next):
     logger.info(f"Request: {request.method} {request.url}")
     response = await call_next(request)
     logger.info(f"Response: {response.status_code}")
@@ -58,7 +66,7 @@ class MinutiaeRequest(BaseModel):
     cedula: str
     minucias: str
     dedo: str
-    
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "message": "API is running"}
