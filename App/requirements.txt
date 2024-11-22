@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+gunicorn
+redis
+boto3
+python-json-logger
+aws-xray-sdk
