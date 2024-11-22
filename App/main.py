@@ -58,6 +58,10 @@ class MinutiaeRequest(BaseModel):
     cedula: str
     minucias: str
     dedo: str
+    
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "message": "API is running"}
 
 # Ruta para verificar las minucias
 @app.post("/verificar/")
