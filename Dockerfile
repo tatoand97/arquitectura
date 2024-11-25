@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 RUN rm -f /etc/nginx/sites-enabled/default
 
 # Copiar la configuración personalizada de Nginx
-COPY arquitectura /etc/nginx/sites-available/arquitectura
+COPY App/arquitectura /etc/nginx/sites-available/arquitectura
 
 # Crear enlace simbólico para habilitar el sitio
 RUN ln -s /etc/nginx/sites-available/arquitectura /etc/nginx/sites-enabled/
@@ -26,14 +26,17 @@ RUN ln -s /etc/nginx/sites-available/arquitectura /etc/nginx/sites-enabled/
 # Copiar archivos de la aplicación
 COPY . /app/
 
+# Copiar el archivo de requisitos a la raíz del contenedor
+COPY App/requirements.txt /app/requirements.txt
+
 # Configurar entorno virtual e instalar dependencias
 RUN python3 -m venv venv && \
     . venv/bin/activate && \
     pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r /app/requirements.txt
 
 # Exponer el puerto 80
 EXPOSE 80
 
 # Comando para iniciar Nginx y Uvicorn
-CMD ["sh", "-c", "nginx && /app/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "nginx && /app/venv/bin/uvicorn App.main:app --host 0.0.0.0 --port 8000"]
