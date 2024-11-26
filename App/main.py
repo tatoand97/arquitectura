@@ -8,8 +8,7 @@ from pythonjsonlogger import jsonlogger
 from redis.exceptions import RedisError
 from decimal import Decimal
 import time
-
-
+import uuid
 
 # Configuración de AWS y Redis
 REDIS_HOST = "fingerprintcache-h7s5ms.serverless.use2.cache.amazonaws.com"
@@ -50,7 +49,7 @@ def decimal_to_standard(obj):
     else:
         return obj
 
-def save_log_to_dynamodb(level: str, message: str, additional_data: dict = None):
+def save_log_to_dynamodb(level: str, message: str, trace_id: str, additional_data: dict = None):
     """
     Guarda un log en la tabla DynamoDB FingerprintLogs.
     """
@@ -69,8 +68,9 @@ def save_log_to_dynamodb(level: str, message: str, additional_data: dict = None)
         additional_data = convert_to_decimal(additional_data) if additional_data else {}
         
         log_item = {
-            "log_id": f"log-{int(time.time() * 1000)}",  # Generar ID único basado en timestamp
-            "timestamp": Decimal(str(time.time())),  # Convertir timestamp a Decimal
+            "log_id": f"log-{int(time.time() * 1000)}", # Generar ID único basado en timestamp
+            "trace_id": trace_id, # Añadir trace_id
+            "timestamp": Decimal(str(time.time())), # Convertir timestamp a Decimal
             "level": level,
             "message": message,
             "additional_data": additional_data
@@ -110,10 +110,11 @@ async def compare_minutiae(request: CompareRequest):
     """
     Compara las minucias recibidas con las almacenadas en el cache Redis o DynamoDB llamando a una función Lambda.
     """
+    trace_id = str(uuid.uuid4()) # Generar un trace_id único para esta petición
     try:
         cache_key = f"fingerprint:{request.cedula}-{request.dedo}"
         logger.info(f"Verificando clave en Redis: {cache_key}")
-        save_log_to_dynamodb("INFO", "Iniciando comparación de minucias.", {"cache_key": cache_key})
+        save_log_to_dynamodb("INFO", "Iniciando comparación de minucias.", trace_id, {"cache_key": cache_key})
 
         # Medir tiempo de consulta en Redis
         redis_start_time = time.time()
@@ -121,7 +122,7 @@ async def compare_minutiae(request: CompareRequest):
             cached_data = redis_client.get(cache_key)
             redis_duration = time.time() - redis_start_time
             logger.info(f"Tiempo para consultar Redis: {redis_duration:.4f} segundos.")
-            save_log_to_dynamodb("INFO", "Consulta Redis completada.", {"cache_key": cache_key, "duration": f"{redis_duration:.4f}"})
+            save_log_to_dynamodb("INFO", "Consulta Redis completada.", trace_id, {"cache_key": cache_key, "duration": f"{redis_duration:.4f}"})
 
             if cached_data:
                 logger.info(f"Datos encontrados en Redis para clave: {cache_key}")
@@ -131,7 +132,7 @@ async def compare_minutiae(request: CompareRequest):
         except (RedisError, ValueError) as e:
             redis_duration = time.time() - redis_start_time
             logger.warning(f"No se pudo obtener datos de Redis: {str(e)}. Tiempo transcurrido: {redis_duration:.4f} segundos.")
-            save_log_to_dynamodb("WARN", "Fallo al obtener datos de Redis.", {"error": str(e), "duration": f"{redis_duration:.4f}"})
+            save_log_to_dynamodb("WARN", "Fallo al obtener datos de Redis.", trace_id, {"error": str(e), "duration": f"{redis_duration:.4f}"})
 
             # Consultar DynamoDB
             db_start_time = time.time()
@@ -139,16 +140,15 @@ async def compare_minutiae(request: CompareRequest):
             response = table.get_item(Key={"cedula": cedula})
             db_duration = time.time() - db_start_time
             logger.info(f"Tiempo para consultar DynamoDB: {db_duration:.4f} segundos.")
-            save_log_to_dynamodb("INFO", "Consulta DynamoDB completada.", {"cedula": cedula, "duration": f"{db_duration:.4f}"})
-
+            save_log_to_dynamodb("INFO", "Consulta DynamoDB completada.", trace_id, {"cedula": cedula, "duration": f"{db_duration:.4f}"})
             if "Item" not in response:
                 logger.warning(f"Registro no encontrado en DynamoDB para cédula: {cedula}")
-                save_log_to_dynamodb("WARN", "Registro no encontrado en DynamoDB.", {"cedula": cedula})
+                save_log_to_dynamodb("WARN", "Registro no encontrado en DynamoDB.", trace_id, {"cedula": cedula})
                 raise HTTPException(status_code=404, detail="Registro no encontrado en DynamoDB")
             
             record = decimal_to_standard(response["Item"])
             logger.info(f"Minucias encontradas en DynamoDB: {record.get('minutiae')}")
-            save_log_to_dynamodb("INFO", "Datos obtenidos de DynamoDB.", {"record": record})
+            save_log_to_dynamodb("INFO", "Datos obtenidos de DynamoDB.", trace_id, {"record": record})
 
             # Guardar en Redis
             redis_save_start_time = time.time()
@@ -171,21 +171,21 @@ async def compare_minutiae(request: CompareRequest):
         )
         lambda_duration = time.time() - lambda_start_time
         logger.info(f"Tiempo para llamar a Lambda: {lambda_duration:.4f} segundos.")
-        save_log_to_dynamodb("INFO", "Llamada a Lambda completada.", {"payload": payload, "duration": f"{lambda_duration:.4f}"})
+        save_log_to_dynamodb("INFO", "Llamada a Lambda completada.", trace_id, {"payload": payload, "duration": f"{lambda_duration:.4f}"})
         
         # Procesar la respuesta de Lambda
         lambda_result = json.loads(lambda_response["Payload"].read().decode("utf-8"))
         logger.info(f"Respuesta de Lambda: {lambda_result}")
-        save_log_to_dynamodb("INFO", "Lambda ejecutada con éxito.", {"lambda_result": lambda_result})
+        save_log_to_dynamodb("INFO", "Lambda ejecutada con éxito.", trace_id, {"lambda_result": lambda_result})
 
         return {"result": lambda_result}
 
     except ValueError:
         logger.error(f"Error: La cédula {request.cedula} no es un número válido")
-        save_log_to_dynamodb("ERROR", "Cédula no válida.", {"cedula": request.cedula})
+        save_log_to_dynamodb("ERROR", "Cédula no válida.", trace_id, {"cedula": request.cedula})
         raise HTTPException(status_code=400, detail="La cédula debe ser un número")
     
     except Exception as e:
         logger.error(f"Error procesando la solicitud: {str(e)}")
-        save_log_to_dynamodb("ERROR", "Error procesando solicitud.", {"error": str(e)})
+        save_log_to_dynamodb("ERROR", "Error procesando solicitud.", trace_id, {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
