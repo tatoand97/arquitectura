@@ -1,22 +1,21 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import redis
 import boto3
 import json
 import logging
 from pythonjsonlogger import jsonlogger
-from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.core import patch
-from redis.exceptions import RedisError, ConnectionError
+from redis.exceptions import RedisError
 from decimal import Decimal
+import time
 
-# Habilitar rastreo automático para boto3
-patch(["boto3"])
+
 
 # Configuración de AWS y Redis
 REDIS_HOST = "fingerprintcache-h7s5ms.serverless.use2.cache.amazonaws.com"
 REDIS_PORT = 6379
 DYNAMODB_TABLE_NAME = "FingerprintRecords"
+DYNAMODB_LOG_TABLE_NAME = "FingerprintLogs"
 AWS_REGION = "us-east-2"
 LAMBDA_FUNCTION_NAME = "matchingEngine"
 
@@ -24,6 +23,7 @@ LAMBDA_FUNCTION_NAME = "matchingEngine"
 redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True, ssl=True)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+log_table = dynamodb.Table(DYNAMODB_LOG_TABLE_NAME)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 # Crear la aplicación FastAPI
@@ -50,6 +50,37 @@ def decimal_to_standard(obj):
     else:
         return obj
 
+def save_log_to_dynamodb(level: str, message: str, additional_data: dict = None):
+    """
+    Guarda un log en la tabla DynamoDB FingerprintLogs.
+    """
+    try:
+        # Convertir valores adicionales a Decimal si es necesario
+        def convert_to_decimal(data):
+            if isinstance(data, dict):
+                return {k: convert_to_decimal(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return [convert_to_decimal(v) for v in data]
+            elif isinstance(data, float):
+                return Decimal(str(data))  # Convertir float a Decimal
+            else:
+                return data
+
+        additional_data = convert_to_decimal(additional_data) if additional_data else {}
+        
+        log_item = {
+            "log_id": f"log-{int(time.time() * 1000)}",  # Generar ID único basado en timestamp
+            "timestamp": Decimal(str(time.time())),  # Convertir timestamp a Decimal
+            "level": level,
+            "message": message,
+            "additional_data": additional_data
+        }
+        log_table.put_item(Item=log_item)
+        logger.info(f"Log guardado en DynamoDB: {log_item}")
+    except Exception as e:
+        logger.error(f"No se pudo guardar el log en DynamoDB: {str(e)}")
+
+# Rutas de ejemplo para el servicio
 @app.get("/health")
 async def health_check():
     """
@@ -72,7 +103,7 @@ class Minucia(BaseModel):
 class CompareRequest(BaseModel):
     cedula: str
     dedo: str
-    minucia: list[Minucia]  # Cambiado a lista para manejar múltiples minucias
+    minucia: list[Minucia]
 
 @app.post("/compare")
 async def compare_minutiae(request: CompareRequest):
@@ -80,71 +111,81 @@ async def compare_minutiae(request: CompareRequest):
     Compara las minucias recibidas con las almacenadas en el cache Redis o DynamoDB llamando a una función Lambda.
     """
     try:
-        # Convertir cédula y dedo a clave única para Redis
         cache_key = f"fingerprint:{request.cedula}-{request.dedo}"
         logger.info(f"Verificando clave en Redis: {cache_key}")
+        save_log_to_dynamodb("INFO", "Iniciando comparación de minucias.", {"cache_key": cache_key})
 
-        # Intentar obtener datos del cache Redis
+        # Medir tiempo de consulta en Redis
+        redis_start_time = time.time()
         try:
             cached_data = redis_client.get(cache_key)
+            redis_duration = time.time() - redis_start_time
+            logger.info(f"Tiempo para consultar Redis: {redis_duration:.4f} segundos.")
+            save_log_to_dynamodb("INFO", "Consulta Redis completada.", {"cache_key": cache_key, "duration": f"{redis_duration:.4f}"})
+
             if cached_data:
                 logger.info(f"Datos encontrados en Redis para clave: {cache_key}")
                 record = json.loads(cached_data)
             else:
                 raise ValueError("Datos no encontrados en Redis.")
         except (RedisError, ValueError) as e:
-            logger.warning(f"No se pudo obtener datos de Redis: {str(e)}. Consultando DynamoDB...")
+            redis_duration = time.time() - redis_start_time
+            logger.warning(f"No se pudo obtener datos de Redis: {str(e)}. Tiempo transcurrido: {redis_duration:.4f} segundos.")
+            save_log_to_dynamodb("WARN", "Fallo al obtener datos de Redis.", {"error": str(e), "duration": f"{redis_duration:.4f}"})
 
             # Consultar DynamoDB
+            db_start_time = time.time()
             cedula = int(request.cedula)
             response = table.get_item(Key={"cedula": cedula})
+            db_duration = time.time() - db_start_time
+            logger.info(f"Tiempo para consultar DynamoDB: {db_duration:.4f} segundos.")
+            save_log_to_dynamodb("INFO", "Consulta DynamoDB completada.", {"cedula": cedula, "duration": f"{db_duration:.4f}"})
+
             if "Item" not in response:
                 logger.warning(f"Registro no encontrado en DynamoDB para cédula: {cedula}")
+                save_log_to_dynamodb("WARN", "Registro no encontrado en DynamoDB.", {"cedula": cedula})
                 raise HTTPException(status_code=404, detail="Registro no encontrado en DynamoDB")
             
-            # Obtener el registro del dedo especificado
             record = decimal_to_standard(response["Item"])
-            finger = record.get("finger")
-            minutiae_list = record.get("minutiae")
+            logger.info(f"Minucias encontradas en DynamoDB: {record.get('minutiae')}")
+            save_log_to_dynamodb("INFO", "Datos obtenidos de DynamoDB.", {"record": record})
 
-            if finger != request.dedo:
-                logger.warning(f"Dedo solicitado ({request.dedo}) no coincide con el almacenado ({finger})")
-                raise HTTPException(status_code=404, detail="Dedo no encontrado en el registro de DynamoDB")
-            
-            if not minutiae_list:
-                logger.warning(f"Minucia no encontrada en el registro de DynamoDB para cédula: {cedula}")
-                raise HTTPException(status_code=404, detail="Minucia no encontrada en el registro de DynamoDB")
-            
-            logger.info(f"Minucias encontradas en DynamoDB: {minutiae_list}")
-
-            # Guardar los datos en Redis
-            logger.info(f"Guardando datos en Redis para clave: {cache_key}")
+            # Guardar en Redis
+            redis_save_start_time = time.time()
             redis_client.set(cache_key, json.dumps(record))
-            redis_client.expire(cache_key, 3600)  # Expira en 1 hora
+            redis_client.expire(cache_key, 3600)
+            redis_save_duration = time.time() - redis_save_start_time
+            logger.info(f"Tiempo para guardar en Redis: {redis_save_duration:.4f} segundos.")
+            save_log_to_dynamodb("INFO", "Datos guardados en Redis.", {"cache_key": cache_key, "duration": f"{redis_save_duration:.4f}"})
 
         # Llamar a la función Lambda
         payload = {
-            "received_minucia": [m.dict() for m in request.minucia],  # Convertir lista de Minucia a dict
+            "received_minucia": [m.dict() for m in request.minucia],
             "stored_minucia": record["minutiae"]
         }
-        logger.info(f"Llamando a Lambda '{LAMBDA_FUNCTION_NAME}' con payload: {payload}")
-        
+        lambda_start_time = time.time()
         lambda_response = lambda_client.invoke(
             FunctionName=LAMBDA_FUNCTION_NAME,
             InvocationType="RequestResponse",
             Payload=json.dumps(payload)
         )
+        lambda_duration = time.time() - lambda_start_time
+        logger.info(f"Tiempo para llamar a Lambda: {lambda_duration:.4f} segundos.")
+        save_log_to_dynamodb("INFO", "Llamada a Lambda completada.", {"payload": payload, "duration": f"{lambda_duration:.4f}"})
         
         # Procesar la respuesta de Lambda
         lambda_result = json.loads(lambda_response["Payload"].read().decode("utf-8"))
         logger.info(f"Respuesta de Lambda: {lambda_result}")
-        
+        save_log_to_dynamodb("INFO", "Lambda ejecutada con éxito.", {"lambda_result": lambda_result})
+
         return {"result": lambda_result}
 
     except ValueError:
         logger.error(f"Error: La cédula {request.cedula} no es un número válido")
+        save_log_to_dynamodb("ERROR", "Cédula no válida.", {"cedula": request.cedula})
         raise HTTPException(status_code=400, detail="La cédula debe ser un número")
     
     except Exception as e:
         logger.error(f"Error procesando la solicitud: {str(e)}")
+        save_log_to_dynamodb("ERROR", "Error procesando solicitud.", {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
