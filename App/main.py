@@ -156,7 +156,7 @@ async def compare_minutiae(request: CompareRequest):
             redis_client.expire(cache_key, 3600)
             redis_save_duration = time.time() - redis_save_start_time
             logger.info(f"Tiempo para guardar en Redis: {redis_save_duration:.4f} segundos.")
-            save_log_to_dynamodb("INFO", "Datos guardados en Redis.", {"cache_key": cache_key, "duration": f"{redis_save_duration:.4f}"})
+            save_log_to_dynamodb("INFO", "Datos guardados en Redis.",  trace_id,  {"cache_key": cache_key, "duration": f"{redis_save_duration:.4f}"})
 
         # Llamar a la función Lambda
         payload = {
