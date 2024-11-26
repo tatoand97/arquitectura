@@ -72,12 +72,12 @@ class Minucia(BaseModel):
 class CompareRequest(BaseModel):
     cedula: str
     dedo: str
-    minucia: Minucia
+    minucia: list[Minucia]  # Cambiado a lista para manejar múltiples minucias
 
 @app.post("/compare")
 async def compare_minutiae(request: CompareRequest):
     """
-    Compara la minucia recibida con la almacenada en el cache Redis o DynamoDB llamando a una función Lambda.
+    Compara las minucias recibidas con las almacenadas en el cache Redis o DynamoDB llamando a una función Lambda.
     """
     try:
         # Convertir cédula y dedo a clave única para Redis
@@ -124,7 +124,7 @@ async def compare_minutiae(request: CompareRequest):
 
         # Llamar a la función Lambda
         payload = {
-            "received_minucia": request.minucia.dict(),
+            "received_minucia": [m.dict() for m in request.minucia],  # Convertir lista de Minucia a dict
             "stored_minucia": record["minutiae"]
         }
         logger.info(f"Llamando a Lambda '{LAMBDA_FUNCTION_NAME}' con payload: {payload}")
